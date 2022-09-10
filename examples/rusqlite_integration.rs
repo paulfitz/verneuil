@@ -41,10 +41,13 @@ fn main() {
                     verneuil::replication_target::S3ReplicationTarget {
                         region: option_env!("DEFAULT_REGION").unwrap().into(),
                         endpoint: None,
+                        hostname: None,
                         // You will want to rename these two buckets to
                         // something for which you have credentials.
                         chunk_bucket: option_env!("DEFAULT_CHUNK_BUCKET").unwrap().into(),
+                        chunk_prefix: None,
                         manifest_bucket: option_env!("DEFAULT_MANIFEST_BUCKET").unwrap().into(),
+                        manifest_prefix: None,
                         domain_addressing: true,
                         create_buckets_on_demand: false,
                     },

@@ -58,6 +58,13 @@ pub(crate) fn boot_id() -> &'static str {
 }
 
 fn find_hostname() -> Result<&'static str> {
+    /*
+    match env::var("VERNEUIL_HOSTNAME") {
+        Ok(v) => return Ok(Box::leak(v.into_boxed_str())),
+        _ => 1,
+    };
+     */
+
     let file = File::open("/etc/hostname")?;
 
     match std::io::BufReader::new(file).lines().next() {
@@ -67,12 +74,26 @@ fn find_hostname() -> Result<&'static str> {
     }
 }
 
+lazy_static::lazy_static! {
+    static ref DEFAULT_POOL: std::sync::RwLock<String> =
+        Default::default();
+}
+
+pub(crate) fn set_hostname(hostname: &String) {
+    *DEFAULT_POOL.write().unwrap() = hostname.clone();
+}
+
 /// Returns the machine's hostname, or a default placeholder if none.
 pub fn hostname() -> &'static str {
     lazy_static::lazy_static! {
-        static ref NAME: &'static str = find_hostname().unwrap_or(DEFAULT_HOSTNAME);
+        static ref NAME: &'static str = {
+            let x = DEFAULT_POOL.read().unwrap();
+            if x.len() > 0 {
+                return Box::leak(x.clone().into_boxed_str());
+            }
+            find_hostname().unwrap_or(DEFAULT_HOSTNAME)
+        };
     }
-
     &NAME
 }
 

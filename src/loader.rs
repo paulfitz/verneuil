@@ -71,6 +71,12 @@ pub struct Chunk {
     payload: memmap2::Mmap,
 }
 
+#[derive(Debug)]
+pub(crate) struct BucketWithPrefix {
+    pub bucket: Bucket,
+    pub prefix: Option<String>,
+}
+
 impl Chunk {
     /// Returns the fingerprint for this chunk's data.
     pub fn fprint(&self) -> Fingerprint {
@@ -86,7 +92,7 @@ impl Chunk {
 #[derive(Debug)]
 pub(crate) struct Loader {
     cache: kismet_cache::Cache,
-    remote_sources: Vec<Bucket>,
+    remote_sources: Vec<BucketWithPrefix>,
     // These chunks will be returned without involving any cache nor
     // `remote_sources`.
     known_chunks: HashMap<Fingerprint, Arc<Chunk>>,
@@ -282,7 +288,7 @@ pub(crate) fn fetch_manifest(
             Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
         for source in remote {
-            let bucket = create_source(source, &creds, |s3| &s3.manifest_bucket)?;
+            let bucket = create_source(source, &creds, |s3| &s3.manifest_bucket, |s3| &s3.manifest_prefix)?;
             if let Some(bucket) = bucket {
                 if let Some(fetched) = load_from_source(&bucket, name)? {
                     return Ok(Some(fetched));
@@ -312,7 +318,7 @@ impl Loader {
                 Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
             for source in remote {
-                if let Some(bucket) = create_source(source, &creds, |s3| &s3.chunk_bucket)? {
+                if let Some(bucket) = create_source(source, &creds, |s3| &s3.chunk_bucket, |s3| &s3.chunk_prefix)? {
                     remote_sources.push(bucket);
                 }
             }
@@ -551,18 +557,20 @@ fn fetch_from_cache(key: Fingerprint) -> Option<Arc<Chunk>> {
     Some(upgraded)
 }
 
-#[instrument(level = "debug", skip(creds, bucket_extractor), err)]
+#[instrument(level = "debug", skip(creds, bucket_extractor, prefix_extractor), err)]
 fn create_source(
     source: &ReplicationTarget,
     creds: &Credentials,
     bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
-) -> Result<Option<Bucket>> {
+    prefix_extractor: impl FnOnce(&S3ReplicationTarget) -> &Option<String>,
+) -> Result<Option<BucketWithPrefix>> {
     use ReplicationTarget::*;
 
     match source {
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
             let bucket_name = bucket_extractor(s3);
+            let prefix = prefix_extractor(s3);
             let mut bucket = Bucket::new(bucket_name, region, creds.clone())
                 .map_err(|e| chain_error!(e, "failed to create chunks S3 bucket object", ?s3))?;
 
@@ -573,7 +581,7 @@ fn create_source(
             }
 
             bucket.set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
-            Ok(Some(bucket))
+            Ok(Some(BucketWithPrefix { bucket, prefix: prefix.clone() }))
         }
         ReadOnly(_) | Local(_) => Ok(None),
     }
@@ -599,7 +607,7 @@ fn call_with_slow_logging<T>(
 }
 
 /// Attempts to load the blob `name` from `source`.
-pub(crate) fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn load_from_source(source: &BucketWithPrefix, name: &str) -> Result<Option<Vec<u8>>> {
     // Run `load_from_source_impl` in our private (rayon) thread pool
     // to avoid clashes between `impl`'s use of our internal runtime
     // and any tokio runtime in the caller's context...
@@ -612,15 +620,20 @@ pub(crate) fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec
     }
 }
 
-fn load_from_source_impl(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
+fn load_from_source_impl(source_with_prefix: &BucketWithPrefix, name: &str) -> Result<Option<Vec<u8>>> {
     use rand::Rng;
 
+    let source = &source_with_prefix.bucket;
+    let full_name = match &source_with_prefix.prefix {
+        None => name.to_owned(),
+        Some(prefix) => prefix.clone() + name,
+    };
     let mut rng = rand::thread_rng();
     for i in 0..=LOAD_RETRY_LIMIT {
         match call_with_slow_logging(
             LOAD_REQUEST_TIMEOUT,
-            || block_on_with_executor(|| source.get_object(name)),
-            |duration| tracing::info!(?duration, ?name, "slow S3 GET"),
+            || block_on_with_executor(|| source.get_object(&full_name)),
+            |duration| tracing::info!(?duration, ?full_name, "slow S3 GET"),
         ) {
             Ok((payload, 200)) => return Ok(Some(payload)),
             // All callers propagate 404s as hard failures.  We might
@@ -646,7 +659,7 @@ fn load_from_source_impl(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>>
                     ?err,
                     ?backoff,
                     %source.name,
-                    %name,
+                    %full_name,
                     "backing off after a failed GET"
                 );
                 std::thread::sleep(backoff);

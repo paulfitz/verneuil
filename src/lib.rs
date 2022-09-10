@@ -59,6 +59,8 @@ pub struct Options {
 
     /// Global policy when loading snapshot data.
     pub snapshot_loading_policy: SnapshotLoadingPolicy,
+
+    pub hostname: Option<String>,
 }
 
 #[repr(C)]
@@ -77,11 +79,7 @@ extern "C" {
     fn verneuil_test_only_register() -> i32;
 }
 
-/// Attempts to parse the Verneuil config in `config`.  The string's
-/// contents must be a config JSON for an `Options` struct, or a
-/// "@/path/to/config_file.json".
-#[tracing::instrument]
-pub fn parse_configuration_string(config: &str) -> Option<Options> {
+fn parse_configuration_string_core(config: &str) -> Option<Options> {
     if let Some(path) = config.strip_prefix('@') {
         let contents = match std::fs::read(path) {
             Ok(contents) => contents,
@@ -113,6 +111,21 @@ pub fn parse_configuration_string(config: &str) -> Option<Options> {
             }
         }
     }
+}
+
+/// Attempts to parse the Verneuil config in `config`.  The string's
+/// contents must be a config JSON for an `Options` struct, or a
+/// "@/path/to/config_file.json".
+#[tracing::instrument]
+pub fn parse_configuration_string(config: &str) -> Option<Options> {
+    let options = parse_configuration_string_core(config);
+    // hostname is awkward
+    if let Some(ref options) = options {
+        if let Some(hostname) = &options.hostname {
+            instance_id::set_hostname(hostname);
+        }
+    };
+    options
 }
 
 /// Attempts to load a default Verneuil configuration from the
@@ -490,8 +503,8 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
             .map_err(|e| chain_error!(e, "failed to create S3 bucket", path))?;
         bucket.set_subdomain_style();
         bucket.set_request_timeout(Some(DOWNLOAD_TIMEOUT));
-
-        loader::load_from_source(&bucket, blob)
+        let bucket_with_prefix = loader::BucketWithPrefix { bucket, prefix: None };
+        loader::load_from_source(&bucket_with_prefix, blob)
     } else if let Some(suffix) = path.strip_prefix("verneuil://") {
         let (machine, path) = match suffix.split_once("/") {
             Some((machine, path)) => (machine, format!("/{}", path)),

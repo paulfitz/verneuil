@@ -34,11 +34,15 @@ pub struct S3ReplicationTarget {
     #[serde(default)]
     pub endpoint: Option<String>,
 
+    pub hostname: Option<String>,
+
     /// Bucket name for content-addressed chunks.
     pub chunk_bucket: String,
+    pub chunk_prefix: Option<String>,
 
     /// Bucket name for manifest blobs.
     pub manifest_bucket: String,
+    pub manifest_prefix: Option<String>,
 
     /// If true, address buckets as subdomains (modern); otherwise,
     /// use the legacy bucket-as-path mode.

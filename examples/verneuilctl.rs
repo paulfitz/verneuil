@@ -190,7 +190,7 @@ struct ManifestName {
     hostname: Option<String>,
 }
 
-fn manifest_name(cmd: ManifestName) -> Result<()> {
+fn manifest_name(cmd: ManifestName, _config: Options) -> Result<()> {
     println!(
         "{}",
         verneuil::manifest_name_for_hostname_path(cmd.hostname.as_deref(), &cmd.source)
@@ -518,7 +518,7 @@ pub fn main() -> Result<()> {
 
     match opts.cmd {
         Command::Restore(cmd) => restore(cmd, replication_config(ApplyConfig::Replication)?),
-        Command::ManifestName(cmd) => manifest_name(cmd),
+        Command::ManifestName(cmd) => manifest_name(cmd, replication_config(ApplyConfig::No)?),
         Command::Manifest(cmd) => manifest(cmd, replication_config(ApplyConfig::No)?),
         Command::Flush(cmd) => flush(cmd),
         Command::Sync(cmd) => sync(cmd, replication_config(ApplyConfig::All)?),

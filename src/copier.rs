@@ -736,18 +736,20 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
 /// Attempts to configure a `Bucket` from a `ReplicationTarget`.  Once
 /// configured, the `Copier` will use the same bucket object to
 /// publish objects.
-#[instrument(level = "debug", skip(bucket_extractor, creds), err)]
+#[instrument(level = "debug", skip(bucket_extractor, prefix_extractor, creds), err)]
 fn create_target(
     target: &ReplicationTarget,
     bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
+    prefix_extractor: impl FnOnce(&S3ReplicationTarget) -> &Option<String>,
     creds: Credentials,
-) -> Result<Option<Bucket>> {
+) -> Result<Option<crate::loader::BucketWithPrefix>> {
     use ReplicationTarget::*;
 
     match target {
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
             let bucket_name = bucket_extractor(s3);
+            let bucket_prefix = prefix_extractor(s3);
             let mut bucket = Bucket::new(bucket_name, region, creds)
                 .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;
 
@@ -762,7 +764,7 @@ fn create_target(
             }
 
             bucket.set_request_timeout(Some(COPY_REQUEST_TIMEOUT));
-            Ok(Some(bucket))
+            Ok(Some(crate::loader::BucketWithPrefix { bucket, prefix: bucket_prefix.clone() }))
         }
         ReadOnly(_) | Local(_) => Ok(None),
     }
@@ -812,7 +814,7 @@ async fn copy_file(
     name: &OsStr,
     contents: &mut File,
     level: i32,
-    targets: &[Bucket],
+    targets: &[crate::loader::BucketWithPrefix],
 ) -> Result<()> {
     use rand::Rng;
     use std::io::Read;
@@ -853,10 +855,15 @@ async fn copy_file(
     }
 
     for target in targets {
+        let bucket = &target.bucket;
+        let blob_name = match &target.prefix {
+            None => blob_name.to_owned(),
+            Some(prefix) => prefix.clone() + blob_name,
+        };
         for i in 0..=COPY_RETRY_LIMIT {
             match await_with_slow_logging(
                 Duration::from_secs(10),
-                || target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE),
+                || bucket.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE),
                 |duration| tracing::info!(?duration, ?blob_name, len = bytes.len(), "slow S3 PUT"),
             )
             .await
@@ -875,7 +882,7 @@ async fn copy_file(
                     return Err(chain_error!(
                         (body, code),
                         "failed to post chunk",
-                        %target.name,
+                        %bucket.name,
                         ?blob_name,
                         len = bytes.len()
                     ));
@@ -885,7 +892,7 @@ async fn copy_file(
                         return Err(chain_warn!(
                             err,
                             "reached retry limit",
-                            %target.name,
+                            %bucket.name,
                             ?blob_name,
                             COPY_RETRY_LIMIT,
                             len = bytes.len()
@@ -899,7 +906,7 @@ async fn copy_file(
                     tracing::info!(
                         ?err,
                         ?backoff,
-                        %target.name,
+                        %bucket.name,
                         ?blob_name,
                         len = bytes.len(),
                         "backing off after a failed PUT"
@@ -922,7 +929,7 @@ async fn copy_file(
 /// remote blob store and something is actively wrong with `blob_name`
 /// (e.g., it doesn't exist).
 #[instrument(level = "debug", skip(targets), err)]
-fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
+fn touch_blob(blob_name: &str, targets: &mut [crate::loader::BucketWithPrefix]) -> Result<()> {
     use rand::Rng;
 
     const COPY_SOURCE: &str = "x-amz-copy-source";
@@ -932,6 +939,11 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
     let mut rng = rand::thread_rng();
 
     for target in targets {
+        let blob_name = match &target.prefix {
+            None => blob_name.to_owned(),
+            Some(prefix) => prefix.clone() + blob_name,
+        };
+        let target = &mut target.bucket;
         let location_name = format!("{}/{}", target.name, blob_name);
         // The value must be URL encoded (yes, that is double encoding
         // given that blob names are themselves percent encoded).
@@ -1306,7 +1318,7 @@ impl CopierWorker {
             let chunks_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+                .map(|target| create_target(target, |s3| &s3.chunk_bucket, |s3| &s3.chunk_prefix, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
                 .flatten() // remove None
                 .collect::<Vec<_>>();
@@ -1358,7 +1370,7 @@ impl CopierWorker {
             let meta_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
+                .map(|target| create_target(target, |s3| &s3.manifest_bucket, |s3| &s3.manifest_prefix, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
@@ -1475,7 +1487,7 @@ impl CopierWorker {
             let chunks_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+                .map(|target| create_target(target, |s3| &s3.chunk_bucket, |s3| &s3.manifest_prefix, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
                 .flatten() // Drop `None`.
                 .collect::<Vec<_>>();
@@ -1580,7 +1592,7 @@ impl CopierWorker {
             let meta_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
+                .map(|target| create_target(target, |s3| &s3.manifest_bucket, |s3| &s3.manifest_prefix, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
@@ -1908,7 +1920,7 @@ impl CopierWorker {
         let mut chunks_buckets = targets
             .replication_targets
             .iter()
-            .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+            .map(|target| create_target(target, |s3| &s3.chunk_bucket, |s3| &s3.chunk_prefix, creds.clone()))
             .flatten() // TODO: how do we want to handle failures here?
             .flatten() // Drop `None`
             .collect::<Vec<_>>();
